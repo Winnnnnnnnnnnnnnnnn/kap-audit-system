@@ -27,7 +27,7 @@ st.set_page_config(
 def check_password():
     """Mengembalikan True jika pengguna memasukkan kata sandi yang benar."""
     def password_entered():
-        target_password = st.secrets.get("APP_PASSWORD",)
+        target_password = st.secrets.get("APP_PASSWORD")
         if st.session_state["password_input"] == target_password:
             st.session_state["password_correct"] = True
             del st.session_state["password_input"]
