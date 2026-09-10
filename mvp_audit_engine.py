@@ -214,7 +214,7 @@ def map_client_accounts(client_account_names, key):
     ]
     """
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -239,7 +239,7 @@ def analyze_pdf_with_gemini(pdf_text, key):
     Gunakan Bahasa Indonesia yang formal dan terstruktur rapi.
     """
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt
     )
     return response.text
