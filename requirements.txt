@@ -5,3 +5,5 @@ xlrd
 google-genai
 python-dotenv
 pypdf
+patool
+rarfile
