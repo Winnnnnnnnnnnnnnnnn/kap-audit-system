@@ -12,9 +12,9 @@ from google import genai
 from google.genai import types
 from pypdf import PdfReader
 
-# 0. LOAD ENVIRONMENT VARIABLES
+# 0. LOAD ENVIRONMENT VARIABLES & SECRETS
 load_dotenv()
-api_key = os.environ.get("GEMINI_API_KEY", "")
+api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 
 # KONFIGURASI HALAMAN STREAMLIT
 st.set_page_config(
@@ -23,7 +23,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- SISTEM PROTEKSI GERBANG PASSWORD ---
+# --- SISTEM PROTEKSI GERBANG PASSWORD (TETAP AKTIF) ---
 def check_password():
     """Mengembalikan True jika pengguna memasukkan kata sandi yang benar."""
     def password_entered():
@@ -49,7 +49,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- KODE APLIKASI UTAMA (MAPPING, UPLOAD, DLL) BERJALAN DI BAWAH SINI ---
+# --- KODE APLIKASI UTAMA BERJALAN DI BAWAH SINI ---
 
 # 1. STANDAR AKUN & KODE INDEKS KKP KAP (ALSINDO TEMPLATE)
 AUDIT_INDEX_CATALOG = {
@@ -79,7 +79,7 @@ AUDIT_INDEX_CATALOG = {
     "TAX_EXP": "Beban Pajak Penghasilan"
 }
 
-# 2. HELPER DETEKSI BARIS HEADER OTOMATIS (MURNI STRUKTURAL TANPA KEYWORDS)
+# 2. HELPER DETEKSI BARIS HEADER OTOMATIS (MURNI STRUKTURAL)
 def detect_table_header_index(df_sample: pd.DataFrame) -> int:
     best_row_idx = 0
     max_score = -1.0
@@ -192,7 +192,7 @@ def sanitize_dataframe(df):
             clean_df[col] = clean_df[col].astype(str).replace("nan", "").replace("None", "")
     return clean_df
 
-# 6. PEMBERSIH ANGKA / NOMINAL (MENDUKUNG FORMAT KOMA MAUPUN TITIK)
+# 6. PEMBERSIH ANGKA / NOMINAL
 def clean_currency_to_float(series: pd.Series) -> pd.Series:
     """Membersihkan simbol mata uang, format ribuan koma/titik, dan tanda kurung negatif."""
     if pd.api.types.is_numeric_dtype(series):
@@ -292,13 +292,13 @@ def create_audit_export_excel(df_mapped, df_rekap):
 st.title("📊 Sistem Audit & Pemetaan KKP Laporan Keuangan")
 st.markdown("Mendukung berkas Excel (`.xlsx`, `.xls`), Dokumen (`.pdf`), dan Paket Arsip (`.rar`, `.zip`).")
 
+# Sidebar: HANYA STATUS KONEKSI (KOTAK INPUT API KEY DIHILANGKAN)
 with st.sidebar:
-    st.header("⚙️ Konfigurasi")
-    if not api_key:
-        api_key = st.text_input("Masukkan Gemini API Key:", type="password")
-        st.caption("Atau atur `GEMINI_API_KEY` di berkas `.env`.")
+    st.header("⚙️ Status Sistem")
+    if api_key:
+        st.success("API Key Aktif (Terhubung)")
     else:
-        st.success("API Key terdeteksi aktif")
+        st.error("GEMINI_API_KEY belum disetel di .env / secrets.")
 
 uploaded_file = st.file_uploader(
     "Unggah Berkas Klien (.xlsx, .xls, .pdf, .rar, .zip):",
@@ -379,18 +379,16 @@ if active_excel is not None:
 
         if st.button("🚀 Petakan Akun Excel via Gemini", type="primary"):
             if not api_key:
-                st.error("API Key belum terisi.")
+                st.error("GEMINI_API_KEY tidak ditemukan di environment.")
             else:
                 with st.spinner("Memproses audit dan mapping akun dengan Gemini 3.6 Flash..."):
                     df_clean = df_raw.copy()
 
-                    # Bersihkan angka nominal saldo
                     df_clean[col_saldo] = clean_currency_to_float(df_clean[col_saldo])
 
                     first_col = df_clean.columns[0]
                     first_str = df_clean[first_col].astype(str).str.strip()
 
-                    # Deteksi nomor akun Buku Besar (harus format nomor akun seperti 1011.1002, BUKAN tanggal 2025-xx)
                     is_acc_header = (
                         first_str.str.contains(r"^\d{4}\.", regex=True) & 
                         ~first_str.str.contains(r"^\d{4}-\d{2}", regex=True)
@@ -399,13 +397,10 @@ if active_excel is not None:
                     has_nested_accounts = is_acc_header.any()
 
                     if has_nested_accounts:
-                        # Format Buku Besar Bertingkat: teruskan nama akun ke seluruh baris transaksinya
                         df_clean["Akun_Terdeteksi"] = df_clean[first_col].where(is_acc_header).ffill()
                         df_clean["Akun_Final"] = df_clean["Akun_Terdeteksi"]
-                        # Ambil hanya baris transaksi aktual
                         df_transaksi = df_clean[~is_acc_header & (df_clean[col_saldo] != 0)].copy()
                     else:
-                        # Format Trial Balance biasa
                         df_clean["Akun_Final"] = df_clean[col_akun]
                         df_transaksi = df_clean[df_clean[col_saldo] != 0].copy()
 
@@ -416,9 +411,7 @@ if active_excel is not None:
                     df_transaksi["Kode_Indeks"] = df_transaksi["Akun_Final"].astype(str).map(map_dict).fillna("LAIN-LAIN")
                     df_transaksi["Kategori_Standar"] = df_transaksi["Kode_Indeks"].map(AUDIT_INDEX_CATALOG).fillna("Belum Terdefinisi")
 
-                    # Perhitungan Saldo Teraudit
                     if has_nested_accounts and "saldo" in col_saldo.lower():
-                        # Untuk Buku Besar, saldo akun adalah SALDO TERAKHIR (bukan jumlah saldo berjalan)
                         saldo_per_akun = (
                             df_transaksi.groupby(["Akun_Final", "Kode_Indeks", "Kategori_Standar"])[col_saldo]
                             .last()
@@ -426,7 +419,6 @@ if active_excel is not None:
                         )
                         rekap_df = saldo_per_akun.groupby(["Kode_Indeks", "Kategori_Standar"])[col_saldo].sum().reset_index()
                     else:
-                        # Untuk Trial Balance / kolom Debet-Kredit biasa: jumlahkan nominal
                         rekap_df = df_transaksi.groupby(["Kode_Indeks", "Kategori_Standar"])[col_saldo].sum().reset_index()
 
                     rekap_df.columns = ["Kode Indeks", "Pos Laporan Standar", "Total Saldo Teraudit"]
@@ -456,7 +448,7 @@ if active_pdf is not None:
 
     if st.button("🔍 Ekstrak & Audit PDF dengan Gemini"):
         if not api_key:
-            st.error("API Key belum terisi.")
+            st.error("GEMINI_API_KEY tidak ditemukan di environment.")
         else:
             with st.spinner("Membaca halaman PDF dan meminta insight auditor dari Gemini..."):
                 try:
