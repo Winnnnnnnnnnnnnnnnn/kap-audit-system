@@ -22,20 +22,19 @@ st.set_page_config(
     page_icon="📊",
     layout="wide"
 )
+
 # --- SISTEM PROTEKSI GERBANG PASSWORD ---
 def check_password():
     """Mengembalikan True jika pengguna memasukkan kata sandi yang benar."""
     def password_entered():
-        # Bandingkan dengan password rahasia (bisa ditaruh di secrets/env)
         target_password = st.secrets.get("APP_PASSWORD", "KAPAlsindo2026")
         if st.session_state["password_input"] == target_password:
             st.session_state["password_correct"] = True
-            del st.session_state["password_input"]  # Hapus dari memori
+            del st.session_state["password_input"]
         else:
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        # Tampilan login awal saat link baru dibuka
         st.subheader("🔒 Akses Terbatas - Portal Audit KAP")
         st.text_input("Masukkan Kata Sandi:", type="password", on_change=password_entered, key="password_input")
         return False
@@ -47,11 +46,11 @@ def check_password():
     else:
         return True
 
-# Jika belum memasukkan password yang benar, hentikan eksekusi kode di bawahnya
 if not check_password():
     st.stop()
 
 # --- KODE APLIKASI UTAMA (MAPPING, UPLOAD, DLL) BERJALAN DI BAWAH SINI ---
+
 # 1. STANDAR AKUN & KODE INDEKS KKP KAP (ALSINDO TEMPLATE)
 AUDIT_INDEX_CATALOG = {
     "A-1": "Kas",
@@ -80,7 +79,37 @@ AUDIT_INDEX_CATALOG = {
     "TAX_EXP": "Beban Pajak Penghasilan"
 }
 
-# 2. HELPER EKSTRAKSI ARSIP (.RAR & .ZIP)
+# 2. HELPER DETEKSI BARIS HEADER OTOMATIS (MURNI STRUKTURAL TANPA KEYWORDS)
+def detect_table_header_index(df_sample: pd.DataFrame) -> int:
+    """
+    Mendeteksi baris header secara murni berdasarkan:
+    1. Kepadatan kolom (density baris, mengabaikan baris judul yang hanya terisi 1-2 sel).
+    2. Dominasi tipe string pendek dan tingkat keunikan nama kolom.
+    """
+    best_row_idx = 0
+    max_score = -1.0
+
+    for idx, row in df_sample.iterrows():
+        non_null_values = [val for val in row if pd.notna(val) and str(val).strip() != ""]
+        num_non_null = len(non_null_values)
+
+        if num_non_null < 2:
+            continue
+
+        density = num_non_null / len(row)
+        text_count = sum(1 for val in non_null_values if isinstance(val, str) and not val.strip().replace(".", "", 1).isdigit())
+        text_ratio = text_count / num_non_null
+        unique_ratio = len(set(non_null_values)) / num_non_null
+
+        score = (density * 0.5) + (text_ratio * 0.3) + (unique_ratio * 0.2)
+
+        if score > max_score and density >= 0.3:
+            max_score = score
+            best_row_idx = idx
+
+    return best_row_idx
+
+# 3. HELPER EKSTRAKSI ARSIP (.RAR & .ZIP)
 def extract_archive_files(uploaded_file):
     extracted_files = {"excel": {}, "pdf": {}}
     file_ext = uploaded_file.name.split(".")[-1].lower()
@@ -96,7 +125,6 @@ def extract_archive_files(uploaded_file):
             z.extractall(tmpdir)
         success = True
     elif file_ext == "rar":
-        # Jalur 1: WinRAR executable bawaan Windows
         winrar_paths = [
             r"C:\Program Files\WinRAR\WinRAR.exe",
             r"C:\Program Files\WinRAR\UnRAR.exe",
@@ -111,7 +139,6 @@ def extract_archive_files(uploaded_file):
             except Exception:
                 pass
 
-        # Jalur 2: Bawaan Windows tar
         if not success:
             try:
                 subprocess.run(["tar", "-xf", temp_archive_path, "-C", tmpdir], check=True, stdout=subprocess.DEVNULL)
@@ -119,7 +146,6 @@ def extract_archive_files(uploaded_file):
             except Exception:
                 pass
 
-        # Jalur 3: Pustaka rarfile
         if not success:
             try:
                 import rarfile
@@ -131,7 +157,6 @@ def extract_archive_files(uploaded_file):
             except Exception:
                 pass
 
-        # Jalur 4: Pustaka patoolib
         if not success:
             try:
                 import patoolib
@@ -140,7 +165,6 @@ def extract_archive_files(uploaded_file):
             except Exception as e:
                 st.error(f"Gagal mengekstrak .rar: {e}. Kamu bisa mengekstraknya manual dan langsung mengunggah file Excel/PDF.")
 
-    # Pindai file hasil ekstraksi
     if success:
         for root, _, files in os.walk(tmpdir):
             for f in files:
@@ -155,7 +179,7 @@ def extract_archive_files(uploaded_file):
 
     return extracted_files
 
-# 3. HELPER PARSING TEKS PDF
+# 4. HELPER PARSING TEKS PDF
 def extract_text_from_pdf(pdf_stream, max_pages=10):
     reader = PdfReader(pdf_stream)
     text_content = []
@@ -165,7 +189,7 @@ def extract_text_from_pdf(pdf_stream, max_pages=10):
         text_content.append(f"--- Halaman {i+1} ---\n{page_text}")
     return "\n".join(text_content)
 
-# 4. SANITASI DATAFRAME AGAR KOMPATIBEL DENGAN APACHE ARROW
+# 5. SANITASI DATAFRAME AGAR KOMPATIBEL DENGAN APACHE ARROW
 def sanitize_dataframe(df):
     clean_df = df.copy()
     for col in clean_df.columns:
@@ -173,7 +197,7 @@ def sanitize_dataframe(df):
             clean_df[col] = clean_df[col].astype(str).replace("nan", "").replace("None", "")
     return clean_df
 
-# 5. GEMINI ENGINES
+# 6. GEMINI ENGINES
 def map_client_accounts(client_account_names, key):
     client = genai.Client(api_key=key)
     prompt = f"""
@@ -190,7 +214,7 @@ def map_client_accounts(client_account_names, key):
     ]
     """
     response = client.models.generate_content(
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -215,12 +239,12 @@ def analyze_pdf_with_gemini(pdf_text, key):
     Gunakan Bahasa Indonesia yang formal dan terstruktur rapi.
     """
     response = client.models.generate_content(
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         contents=prompt
     )
     return response.text
 
-# 6. BUILD EXCEL LAPORAN HASIL
+# 7. BUILD EXCEL LAPORAN HASIL
 def create_audit_export_excel(df_mapped, df_rekap):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -252,7 +276,6 @@ active_pdf = None
 if uploaded_file is not None:
     fname = uploaded_file.name.lower()
 
-    # KONDISI 1: JIKA YANG DIUPLOAD ADALAH ARSIP (.RAR / .ZIP)
     if fname.endswith((".rar", ".zip")):
         with st.spinner("Mengekstrak isi arsip..."):
             extracted = extract_archive_files(uploaded_file)
@@ -269,11 +292,9 @@ if uploaded_file is not None:
                 pilihan_pdf = st.selectbox("Pilih file PDF (misal Rekening Koran):", options=list(extracted["pdf"].keys()))
                 active_pdf = extracted["pdf"][pilihan_pdf]
 
-    # KONDISI 2: FILE LANGSUNG EXCEL
     elif fname.endswith((".xlsx", ".xls")):
         active_excel = uploaded_file
 
-    # KONDISI 3: FILE LANGSUNG PDF
     elif fname.endswith(".pdf"):
         active_pdf = uploaded_file
 
@@ -284,7 +305,19 @@ if active_excel is not None:
     try:
         xls = pd.ExcelFile(active_excel)
         sheet_choice = st.selectbox("Pilih Sheet:", options=xls.sheet_names)
-        df_raw = pd.read_excel(xls, sheet_name=sheet_choice)
+
+        # 1. Pindai 20 baris pertama untuk deteksi posisi baris header secara murni
+        df_sample = pd.read_excel(xls, sheet_name=sheet_choice, header=None, nrows=20)
+        detected_header_idx = detect_table_header_index(df_sample)
+
+        # 2. Baca tabel menggunakan header yang sudah dihitung
+        df_raw = pd.read_excel(xls, sheet_name=sheet_choice, header=detected_header_idx)
+
+        # Buang kolom kosong hasil merge cell di Excel
+        df_raw = df_raw.dropna(how="all", axis=1)
+
+        # Format nama kolom
+        df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
         # Sanitasi data sebelum dipajang ke UI
         df_display = sanitize_dataframe(df_raw.dropna(how="all"))
@@ -292,15 +325,15 @@ if active_excel is not None:
 
         c1, c2 = st.columns(2)
         with c1:
-            col_akun = st.selectbox("Kolom Nama Akun:", options=df_raw.columns, index=0)
+            col_akun = st.selectbox("Kolom Nama Akun / Keterangan:", options=df_raw.columns, index=0)
         with c2:
-            col_saldo = st.selectbox("Kolom Nominal Saldo:", options=df_raw.columns, index=min(1, len(df_raw.columns) - 1))
+            col_saldo = st.selectbox("Kolom Nominal Saldo / Debet / Kredit:", options=df_raw.columns, index=min(1, len(df_raw.columns) - 1))
 
         if st.button("🚀 Petakan Akun Excel via Gemini", type="primary"):
             if not api_key:
                 st.error("API Key belum terisi.")
             else:
-                with st.spinner("Memproses mapping akun dengan Gemini 3.6 Flash..."):
+                with st.spinner("Memproses mapping akun dengan Gemini Flash..."):
                     df_clean = df_raw.dropna(subset=[col_akun]).copy()
                     df_clean[col_saldo] = pd.to_numeric(df_clean[col_saldo], errors="coerce").fillna(0)
 
