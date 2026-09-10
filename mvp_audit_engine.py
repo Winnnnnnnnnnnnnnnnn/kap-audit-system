@@ -81,11 +81,6 @@ AUDIT_INDEX_CATALOG = {
 
 # 2. HELPER DETEKSI BARIS HEADER OTOMATIS (MURNI STRUKTURAL TANPA KEYWORDS)
 def detect_table_header_index(df_sample: pd.DataFrame) -> int:
-    """
-    Mendeteksi baris header secara murni berdasarkan:
-    1. Kepadatan kolom (density baris, mengabaikan baris judul yang hanya terisi 1-2 sel).
-    2. Dominasi tipe string pendek dan tingkat keunikan nama kolom.
-    """
     best_row_idx = 0
     max_score = -1.0
 
@@ -197,7 +192,48 @@ def sanitize_dataframe(df):
             clean_df[col] = clean_df[col].astype(str).replace("nan", "").replace("None", "")
     return clean_df
 
-# 6. GEMINI ENGINES
+# 6. PEMBERSIH ANGKA / NOMINAL (MENDUKUNG FORMAT KOMA MAUPUN TITIK)
+def clean_currency_to_float(series: pd.Series) -> pd.Series:
+    """Membersihkan simbol mata uang, format ribuan koma/titik, dan tanda kurung negatif."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0)
+
+    def parse_val(val):
+        if pd.isna(val):
+            return 0.0
+        val = str(val).strip()
+        if val in ["-", "", "None", "nan"]:
+            return 0.0
+
+        is_negative = False
+        if val.startswith("(") and val.endswith(")"):
+            is_negative = True
+            val = val[1:-1].strip()
+
+        for prefix in ["Rp", "IDR", "rp", "idr"]:
+            val = val.replace(prefix, "").strip()
+
+        if "," in val and "." not in val:
+            val = val.replace(",", "")
+        elif "," in val and "." in val:
+            if val.rfind(",") < val.rfind("."):
+                val = val.replace(",", "")
+            else:
+                val = val.replace(".", "").replace(",", ".")
+        elif "." in val:
+            parts = val.split(".")
+            if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3):
+                val = val.replace(".", "")
+
+        try:
+            res = float(val)
+            return -res if is_negative else res
+        except Exception:
+            return 0.0
+
+    return series.apply(parse_val)
+
+# 7. GEMINI ENGINES
 def map_client_accounts(client_account_names, key):
     client = genai.Client(api_key=key)
     prompt = f"""
@@ -244,7 +280,7 @@ def analyze_pdf_with_gemini(pdf_text, key):
     )
     return response.text
 
-# 7. BUILD EXCEL LAPORAN HASIL
+# 8. BUILD EXCEL LAPORAN HASIL
 def create_audit_export_excel(df_mapped, df_rekap):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -256,7 +292,6 @@ def create_audit_export_excel(df_mapped, df_rekap):
 st.title("📊 Sistem Audit & Pemetaan KKP Laporan Keuangan")
 st.markdown("Mendukung berkas Excel (`.xlsx`, `.xls`), Dokumen (`.pdf`), dan Paket Arsip (`.rar`, `.zip`).")
 
-# Sidebar
 with st.sidebar:
     st.header("⚙️ Konfigurasi")
     if not api_key:
@@ -306,50 +341,99 @@ if active_excel is not None:
         xls = pd.ExcelFile(active_excel)
         sheet_choice = st.selectbox("Pilih Sheet:", options=xls.sheet_names)
 
-        # 1. Pindai 20 baris pertama untuk deteksi posisi baris header secara murni
         df_sample = pd.read_excel(xls, sheet_name=sheet_choice, header=None, nrows=20)
         detected_header_idx = detect_table_header_index(df_sample)
 
-        # 2. Baca tabel menggunakan header yang sudah dihitung
         df_raw = pd.read_excel(xls, sheet_name=sheet_choice, header=detected_header_idx)
-
-        # Buang kolom kosong hasil merge cell di Excel
         df_raw = df_raw.dropna(how="all", axis=1)
-
-        # Format nama kolom
         df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-        # Sanitasi data sebelum dipajang ke UI
         df_display = sanitize_dataframe(df_raw.dropna(how="all"))
         st.dataframe(df_display.head(5), use_container_width=True)
 
+        cols = list(df_raw.columns)
+
+        default_acc_idx = 0
+        for i, c in enumerate(cols):
+            c_clean = str(c).strip().lower()
+            if any(k in c_clean for k in ["keterangan", "uraian", "nama akun", "deskripsi", "account"]):
+                default_acc_idx = i
+                break
+
+        default_val_idx = min(1, len(cols) - 1)
+        for target in ["saldo", "debet", "debit", "nominal", "kredit"]:
+            found = False
+            for i, c in enumerate(cols):
+                if str(c).strip().lower() == target:
+                    default_val_idx = i
+                    found = True
+                    break
+            if found:
+                break
+
         c1, c2 = st.columns(2)
         with c1:
-            col_akun = st.selectbox("Kolom Nama Akun / Keterangan:", options=df_raw.columns, index=0)
+            col_akun = st.selectbox("Kolom Nama Akun / Keterangan:", options=cols, index=default_acc_idx)
         with c2:
-            col_saldo = st.selectbox("Kolom Nominal Saldo / Debet / Kredit:", options=df_raw.columns, index=min(1, len(df_raw.columns) - 1))
+            col_saldo = st.selectbox("Kolom Nominal Saldo / Debet / Kredit:", options=cols, index=default_val_idx)
 
         if st.button("🚀 Petakan Akun Excel via Gemini", type="primary"):
             if not api_key:
                 st.error("API Key belum terisi.")
             else:
-                with st.spinner("Memproses mapping akun dengan Gemini Flash..."):
-                    df_clean = df_raw.dropna(subset=[col_akun]).copy()
-                    df_clean[col_saldo] = pd.to_numeric(df_clean[col_saldo], errors="coerce").fillna(0)
+                with st.spinner("Memproses audit dan mapping akun dengan Gemini 3.6 Flash..."):
+                    df_clean = df_raw.copy()
 
-                    unique_accs = df_clean[col_akun].astype(str).unique().tolist()
+                    # Bersihkan angka nominal saldo
+                    df_clean[col_saldo] = clean_currency_to_float(df_clean[col_saldo])
+
+                    first_col = df_clean.columns[0]
+                    first_str = df_clean[first_col].astype(str).str.strip()
+
+                    # Deteksi nomor akun Buku Besar (harus format nomor akun seperti 1011.1002, BUKAN tanggal 2025-xx)
+                    is_acc_header = (
+                        first_str.str.contains(r"^\d{4}\.", regex=True) & 
+                        ~first_str.str.contains(r"^\d{4}-\d{2}", regex=True)
+                    )
+
+                    has_nested_accounts = is_acc_header.any()
+
+                    if has_nested_accounts:
+                        # Format Buku Besar Bertingkat: teruskan nama akun ke seluruh baris transaksinya
+                        df_clean["Akun_Terdeteksi"] = df_clean[first_col].where(is_acc_header).ffill()
+                        df_clean["Akun_Final"] = df_clean["Akun_Terdeteksi"]
+                        # Ambil hanya baris transaksi aktual
+                        df_transaksi = df_clean[~is_acc_header & (df_clean[col_saldo] != 0)].copy()
+                    else:
+                        # Format Trial Balance biasa
+                        df_clean["Akun_Final"] = df_clean[col_akun]
+                        df_transaksi = df_clean[df_clean[col_saldo] != 0].copy()
+
+                    unique_accs = df_transaksi["Akun_Final"].dropna().astype(str).unique().tolist()
                     mapping_res = map_client_accounts(unique_accs, api_key)
 
                     map_dict = {item["akun_klien"]: item["kode_indeks"] for item in mapping_res}
-                    df_clean["Kode_Indeks"] = df_clean[col_akun].astype(str).map(map_dict).fillna("LAIN-LAIN")
-                    df_clean["Kategori_Standar"] = df_clean["Kode_Indeks"].map(AUDIT_INDEX_CATALOG).fillna("Belum Terdefinisi")
+                    df_transaksi["Kode_Indeks"] = df_transaksi["Akun_Final"].astype(str).map(map_dict).fillna("LAIN-LAIN")
+                    df_transaksi["Kategori_Standar"] = df_transaksi["Kode_Indeks"].map(AUDIT_INDEX_CATALOG).fillna("Belum Terdefinisi")
 
-                    rekap_df = df_clean.groupby(["Kode_Indeks", "Kategori_Standar"])[col_saldo].sum().reset_index()
+                    # Perhitungan Saldo Teraudit
+                    if has_nested_accounts and "saldo" in col_saldo.lower():
+                        # Untuk Buku Besar, saldo akun adalah SALDO TERAKHIR (bukan jumlah saldo berjalan)
+                        saldo_per_akun = (
+                            df_transaksi.groupby(["Akun_Final", "Kode_Indeks", "Kategori_Standar"])[col_saldo]
+                            .last()
+                            .reset_index()
+                        )
+                        rekap_df = saldo_per_akun.groupby(["Kode_Indeks", "Kategori_Standar"])[col_saldo].sum().reset_index()
+                    else:
+                        # Untuk Trial Balance / kolom Debet-Kredit biasa: jumlahkan nominal
+                        rekap_df = df_transaksi.groupby(["Kode_Indeks", "Kategori_Standar"])[col_saldo].sum().reset_index()
+
                     rekap_df.columns = ["Kode Indeks", "Pos Laporan Standar", "Total Saldo Teraudit"]
 
                     st.session_state["rekap_df"] = rekap_df
-                    st.session_state["df_mapped"] = sanitize_dataframe(df_clean)
-                    st.success("Mapping akun berhasil diselesaikan!")
+                    st.session_state["df_mapped"] = sanitize_dataframe(df_transaksi)
+                    st.success("Mapping akun dan kalkulasi saldo akhir berhasil diselesaikan!")
 
     except Exception as e:
         st.error(f"Gagal memproses Excel: {e}")
