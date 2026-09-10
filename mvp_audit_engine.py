@@ -22,7 +22,36 @@ st.set_page_config(
     page_icon="📊",
     layout="wide"
 )
+# --- SISTEM PROTEKSI GERBANG PASSWORD ---
+def check_password():
+    """Mengembalikan True jika pengguna memasukkan kata sandi yang benar."""
+    def password_entered():
+        # Bandingkan dengan password rahasia (bisa ditaruh di secrets/env)
+        target_password = st.secrets.get("APP_PASSWORD", "KAPAlsindo2026")
+        if st.session_state["password_input"] == target_password:
+            st.session_state["password_correct"] = True
+            del st.session_state["password_input"]  # Hapus dari memori
+        else:
+            st.session_state["password_correct"] = False
 
+    if "password_correct" not in st.session_state:
+        # Tampilan login awal saat link baru dibuka
+        st.subheader("🔒 Akses Terbatas - Portal Audit KAP")
+        st.text_input("Masukkan Kata Sandi:", type="password", on_change=password_entered, key="password_input")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.subheader("🔒 Akses Terbatas - Portal Audit KAP")
+        st.text_input("Masukkan Kata Sandi:", type="password", on_change=password_entered, key="password_input")
+        st.error("Kata sandi salah. Silakan hubungi admin.")
+        return False
+    else:
+        return True
+
+# Jika belum memasukkan password yang benar, hentikan eksekusi kode di bawahnya
+if not check_password():
+    st.stop()
+
+# --- KODE APLIKASI UTAMA (MAPPING, UPLOAD, DLL) BERJALAN DI BAWAH SINI ---
 # 1. STANDAR AKUN & KODE INDEKS KKP KAP (ALSINDO TEMPLATE)
 AUDIT_INDEX_CATALOG = {
     "A-1": "Kas",
