@@ -4,3 +4,4 @@ openpyxl
 xlrd
 google-genai
 python-dotenv
+pypdf
