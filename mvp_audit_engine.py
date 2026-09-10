@@ -1,0 +1,327 @@
+import io
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import zipfile
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from pypdf import PdfReader
+
+# 0. LOAD ENVIRONMENT VARIABLES
+load_dotenv()
+api_key = os.environ.get("GEMINI_API_KEY", "")
+
+# KONFIGURASI HALAMAN STREAMLIT
+st.set_page_config(
+    page_title="Audit Assistant - KAP Working Papers",
+    page_icon="📊",
+    layout="wide"
+)
+
+# 1. STANDAR AKUN & KODE INDEKS KKP KAP (ALSINDO TEMPLATE)
+AUDIT_INDEX_CATALOG = {
+    "A-1": "Kas",
+    "A-2": "Bank (IDR / USD)",
+    "A-3": "Piutang Usaha",
+    "A-4": "Piutang Lain-Lain",
+    "A-5": "Persediaan",
+    "A-6": "Uang Muka",
+    "A-7": "Biaya Dibayar Dimuka / Pajak Dimuka",
+    "A-8": "Aset Tetap (Nilai Perolehan & Akumulasi)",
+    "A-9": "Aset Lain-lain",
+    "B-1": "Utang Usaha",
+    "B-2": "Utang Pajak",
+    "B-3": "Utang Lain-lain",
+    "B-4": "Pendapatan Diterima Dimuka",
+    "B-5": "Utang Bank",
+    "B-6": "Utang Leasing",
+    "EQ-1": "Modal Saham",
+    "EQ-2": "Saldo Laba",
+    "REV": "Pendapatan Usaha",
+    "C-1": "Beban Pokok Pendapatan (HPP)",
+    "D-1": "Beban Penjualan",
+    "D-2": "Beban Umum dan Administrasi",
+    "OTHER_REV": "Pendapatan Diluar Usaha",
+    "OTHER_EXP": "Beban Diluar Usaha",
+    "TAX_EXP": "Beban Pajak Penghasilan"
+}
+
+# 2. HELPER EKSTRAKSI ARSIP (.RAR & .ZIP)
+def extract_archive_files(uploaded_file):
+    extracted_files = {"excel": {}, "pdf": {}}
+    file_ext = uploaded_file.name.split(".")[-1].lower()
+
+    tmpdir = tempfile.mkdtemp()
+    temp_archive_path = os.path.join(tmpdir, uploaded_file.name)
+    with open(temp_archive_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    success = False
+    if file_ext == "zip":
+        with zipfile.ZipFile(temp_archive_path, "r") as z:
+            z.extractall(tmpdir)
+        success = True
+    elif file_ext == "rar":
+        # Jalur 1: WinRAR executable bawaan Windows
+        winrar_paths = [
+            r"C:\Program Files\WinRAR\WinRAR.exe",
+            r"C:\Program Files\WinRAR\UnRAR.exe",
+            r"C:\Program Files (x86)\WinRAR\WinRAR.exe"
+        ]
+        winrar_cmd = next((p for p in winrar_paths if os.path.exists(p)), None)
+
+        if winrar_cmd:
+            try:
+                subprocess.run([winrar_cmd, "x", "-y", temp_archive_path, tmpdir], check=True, stdout=subprocess.DEVNULL)
+                success = True
+            except Exception:
+                pass
+
+        # Jalur 2: Bawaan Windows tar
+        if not success:
+            try:
+                subprocess.run(["tar", "-xf", temp_archive_path, "-C", tmpdir], check=True, stdout=subprocess.DEVNULL)
+                success = True
+            except Exception:
+                pass
+
+        # Jalur 3: Pustaka rarfile
+        if not success:
+            try:
+                import rarfile
+                if winrar_cmd:
+                    rarfile.UNRAR_TOOL = winrar_cmd
+                with rarfile.RarFile(temp_archive_path) as rf:
+                    rf.extractall(tmpdir)
+                success = True
+            except Exception:
+                pass
+
+        # Jalur 4: Pustaka patoolib
+        if not success:
+            try:
+                import patoolib
+                patoolib.extract_archive(temp_archive_path, outdir=tmpdir, verbosity=-1)
+                success = True
+            except Exception as e:
+                st.error(f"Gagal mengekstrak .rar: {e}. Kamu bisa mengekstraknya manual dan langsung mengunggah file Excel/PDF.")
+
+    # Pindai file hasil ekstraksi
+    if success:
+        for root, _, files in os.walk(tmpdir):
+            for f in files:
+                full_path = os.path.join(root, f)
+                lower_f = f.lower()
+                if lower_f.endswith((".xlsx", ".xls")) and not lower_f.startswith("~$"):
+                    with open(full_path, "rb") as b:
+                        extracted_files["excel"][f] = io.BytesIO(b.read())
+                elif lower_f.endswith(".pdf") and not lower_f.startswith("~$"):
+                    with open(full_path, "rb") as b:
+                        extracted_files["pdf"][f] = io.BytesIO(b.read())
+
+    return extracted_files
+
+# 3. HELPER PARSING TEKS PDF
+def extract_text_from_pdf(pdf_stream, max_pages=10):
+    reader = PdfReader(pdf_stream)
+    text_content = []
+    total_pages = min(len(reader.pages), max_pages)
+    for i in range(total_pages):
+        page_text = reader.pages[i].extract_text() or ""
+        text_content.append(f"--- Halaman {i+1} ---\n{page_text}")
+    return "\n".join(text_content)
+
+# 4. SANITASI DATAFRAME AGAR KOMPATIBEL DENGAN APACHE ARROW
+def sanitize_dataframe(df):
+    clean_df = df.copy()
+    for col in clean_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(clean_df[col]) or clean_df[col].dtype == "object":
+            clean_df[col] = clean_df[col].astype(str).replace("nan", "").replace("None", "")
+    return clean_df
+
+# 5. GEMINI ENGINES
+def map_client_accounts(client_account_names, key):
+    client = genai.Client(api_key=key)
+    prompt = f"""
+    Kamu adalah auditor senior KAP.
+    Petakan daftar nama akun internal klien berikut:
+    {client_account_names}
+
+    Ke salah satu Kode Indeks KKP standar kami:
+    {json.dumps(AUDIT_INDEX_CATALOG, indent=2)}
+
+    Keluarkan HANYA format JSON valid tanpa tanda backtick atau markdown:
+    [
+      {{"akun_klien": "...", "kode_indeks": "...", "nama_indeks": "..."}}
+    ]
+    """
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.0
+        )
+    )
+    return json.loads(response.text)
+
+def analyze_pdf_with_gemini(pdf_text, key):
+    client = genai.Client(api_key=key)
+    prompt = f"""
+    Kamu adalah auditor senior KAP.
+    Analisis dokumen keuangan / rekening koran PDF berikut:
+    {pdf_text[:15000]}
+
+    Tugasmu:
+    1. Identifikasi Entitas / Nama Bank / No Rekening (jika ada).
+    2. Identifikasi Saldo Awal, Total Mutasi Masuk (Kredit), Total Mutasi Keluar (Debit), dan Saldo Akhir.
+    3. Cocokkan ke nomor indeks KKP KAP (misal Kas Bank = A-2, Pendapatan = REV).
+    4. Buat 3 temuan audit penting.
+
+    Gunakan Bahasa Indonesia yang formal dan terstruktur rapi.
+    """
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt
+    )
+    return response.text
+
+# 6. BUILD EXCEL LAPORAN HASIL
+def create_audit_export_excel(df_mapped, df_rekap):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_rekap.to_excel(writer, sheet_name="Rekap Indeks KKP", index=False)
+        df_mapped.to_excel(writer, sheet_name="Detail Mapping Akun", index=False)
+    return output.getvalue()
+
+# --- TAMPILAN USER INTERFACE (STREAMLIT) ---
+st.title("📊 Sistem Audit & Pemetaan KKP Laporan Keuangan")
+st.markdown("Mendukung berkas Excel (`.xlsx`, `.xls`), Dokumen (`.pdf`), dan Paket Arsip (`.rar`, `.zip`).")
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Konfigurasi")
+    if not api_key:
+        api_key = st.text_input("Masukkan Gemini API Key:", type="password")
+        st.caption("Atau atur `GEMINI_API_KEY` di berkas `.env`.")
+    else:
+        st.success("API Key terdeteksi aktif")
+
+uploaded_file = st.file_uploader(
+    "Unggah Berkas Klien (.xlsx, .xls, .pdf, .rar, .zip):",
+    type=["xlsx", "xls", "pdf", "rar", "zip"]
+)
+
+active_excel = None
+active_pdf = None
+
+if uploaded_file is not None:
+    fname = uploaded_file.name.lower()
+
+    # KONDISI 1: JIKA YANG DIUPLOAD ADALAH ARSIP (.RAR / .ZIP)
+    if fname.endswith((".rar", ".zip")):
+        with st.spinner("Mengekstrak isi arsip..."):
+            extracted = extract_archive_files(uploaded_file)
+            total_excel = len(extracted["excel"])
+            total_pdf = len(extracted["pdf"])
+
+            st.info(f"Ditemukan di dalam arsip: **{total_excel} Excel** dan **{total_pdf} PDF**.")
+
+            if total_excel > 0:
+                pilihan_excel = st.selectbox("Pilih file Excel yang ingin diaudit:", options=list(extracted["excel"].keys()))
+                active_excel = extracted["excel"][pilihan_excel]
+
+            if total_pdf > 0:
+                pilihan_pdf = st.selectbox("Pilih file PDF (misal Rekening Koran):", options=list(extracted["pdf"].keys()))
+                active_pdf = extracted["pdf"][pilihan_pdf]
+
+    # KONDISI 2: FILE LANGSUNG EXCEL
+    elif fname.endswith((".xlsx", ".xls")):
+        active_excel = uploaded_file
+
+    # KONDISI 3: FILE LANGSUNG PDF
+    elif fname.endswith(".pdf"):
+        active_pdf = uploaded_file
+
+# --- PROSES EXCEL (MAPPING AKUN KKP) ---
+if active_excel is not None:
+    st.divider()
+    st.subheader("📑 Modul Audit Excel (Trial Balance / Akun)")
+    try:
+        xls = pd.ExcelFile(active_excel)
+        sheet_choice = st.selectbox("Pilih Sheet:", options=xls.sheet_names)
+        df_raw = pd.read_excel(xls, sheet_name=sheet_choice)
+
+        # Sanitasi data sebelum dipajang ke UI
+        df_display = sanitize_dataframe(df_raw.dropna(how="all"))
+        st.dataframe(df_display.head(5), use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            col_akun = st.selectbox("Kolom Nama Akun:", options=df_raw.columns, index=0)
+        with c2:
+            col_saldo = st.selectbox("Kolom Nominal Saldo:", options=df_raw.columns, index=min(1, len(df_raw.columns) - 1))
+
+        if st.button("🚀 Petakan Akun Excel via Gemini", type="primary"):
+            if not api_key:
+                st.error("API Key belum terisi.")
+            else:
+                with st.spinner("Memproses mapping akun dengan Gemini 3.6 Flash..."):
+                    df_clean = df_raw.dropna(subset=[col_akun]).copy()
+                    df_clean[col_saldo] = pd.to_numeric(df_clean[col_saldo], errors="coerce").fillna(0)
+
+                    unique_accs = df_clean[col_akun].astype(str).unique().tolist()
+                    mapping_res = map_client_accounts(unique_accs, api_key)
+
+                    map_dict = {item["akun_klien"]: item["kode_indeks"] for item in mapping_res}
+                    df_clean["Kode_Indeks"] = df_clean[col_akun].astype(str).map(map_dict).fillna("LAIN-LAIN")
+                    df_clean["Kategori_Standar"] = df_clean["Kode_Indeks"].map(AUDIT_INDEX_CATALOG).fillna("Belum Terdefinisi")
+
+                    rekap_df = df_clean.groupby(["Kode_Indeks", "Kategori_Standar"])[col_saldo].sum().reset_index()
+                    rekap_df.columns = ["Kode Indeks", "Pos Laporan Standar", "Total Saldo Teraudit"]
+
+                    st.session_state["rekap_df"] = rekap_df
+                    st.session_state["df_mapped"] = sanitize_dataframe(df_clean)
+                    st.success("Mapping akun berhasil diselesaikan!")
+
+    except Exception as e:
+        st.error(f"Gagal memproses Excel: {e}")
+
+# Tampilan Hasil Excel
+if "rekap_df" in st.session_state:
+    st.dataframe(st.session_state["rekap_df"].style.format({"Total Saldo Teraudit": "Rp {:,.0f}"}), use_container_width=True)
+    excel_exp = create_audit_export_excel(st.session_state["df_mapped"], st.session_state["rekap_df"])
+    st.download_button(
+        label="📥 Unduh File Excel KKP Hasil Audit",
+        data=excel_exp,
+        file_name="Hasil_Mapping_Audit_KKP.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# --- PROSES PDF (REKENING KORAN / LAPORAN AUDIT) ---
+if active_pdf is not None:
+    st.divider()
+    st.subheader("📄 Modul Analisis Dokumen PDF (Rekening Koran / Bukti Audit)")
+
+    if st.button("🔍 Ekstrak & Audit PDF dengan Gemini"):
+        if not api_key:
+            st.error("API Key belum terisi.")
+        else:
+            with st.spinner("Membaca halaman PDF dan meminta insight auditor dari Gemini..."):
+                try:
+                    pdf_text = extract_text_from_pdf(active_pdf)
+                    audit_analysis = analyze_pdf_with_gemini(pdf_text, api_key)
+
+                    st.success("Analisis PDF Selesai!")
+                    st.markdown("### Ringkasan Hasil Pemeriksaan Dokumen:")
+                    st.markdown(audit_analysis)
+
+                    with st.expander("Lihat Ekstrak Teks Mentah dari PDF"):
+                        st.text(pdf_text[:3000] + "\n\n... (dipotong untuk pratinjau)")
+                except Exception as ex:
+                    st.error(f"Gagal membaca PDF: {ex}")
